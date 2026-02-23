@@ -1,0 +1,4 @@
+agent_mode: baseline
+env:
+  level_name: Soccer_Field_Easy
+  race_tier: 1

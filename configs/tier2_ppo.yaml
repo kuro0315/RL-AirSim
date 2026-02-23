@@ -1,0 +1,8 @@
+agent_mode: ppo
+env:
+  level_name: Soccer_Field_Easy
+  race_tier: 2
+rule_assist:
+  rule_mix: 0.15
+training:
+  iterations: 50

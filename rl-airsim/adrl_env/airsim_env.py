@@ -37,6 +37,12 @@ DEFAULT_ENV_CONFIG: dict[str, Any] = {
     "rule_based_controller": "gate_navigator",
     "rule_controller_config": {},
     "rule_mixing_ratio": 0.0,
+    "enable_image_benchmark": False,
+    "image_benchmark_config": {
+        "benchmark_type": "simGetImages",
+        "period_sec": 0.05,
+        "camera_name": "fpv_cam",
+    },
 }
 
 
@@ -120,6 +126,7 @@ class AirSimDroneRacingEnv(gym.Env):
         self.reward_collision = float(self.config["reward_collision"])
         self.reward_success = float(self.config["reward_success"])
         self.rule_mixing_ratio = float(self.config["rule_mixing_ratio"])
+        self.enable_image_benchmark = bool(self.config.get("enable_image_benchmark", False))
 
         self.action_space = spaces.Box(
             low=np.array([-1.0, -1.0, -1.0, -1.0], dtype=np.float32),
@@ -134,6 +141,8 @@ class AirSimDroneRacingEnv(gym.Env):
         )
 
         self.client: Any = None
+        self.image_client: Any = None
+        self.image_benchmarker: Any = None
         self._loaded_level_name: Optional[str] = None
 
         self.current_gate_index = 0
@@ -146,7 +155,12 @@ class AirSimDroneRacingEnv(gym.Env):
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict[str, Any]] = None):
         super().reset(seed=seed)
         self._connect()
+        if self.image_benchmarker is not None:
+            self.image_benchmarker.stop()
+            self.image_benchmarker.reset_stats()
         self._reset_race_world(options or {})
+        if self.image_benchmarker is not None:
+            self.image_benchmarker.start()
 
         position, linear_velocity, angular_velocity, orientation = self._read_kinematics()
         self.previous_distance = self._distance_to_current_gate(position)
@@ -213,6 +227,11 @@ class AirSimDroneRacingEnv(gym.Env):
         return observation, float(reward), terminated, truncated, info
 
     def close(self):
+        if self.image_benchmarker is not None:
+            try:
+                self.image_benchmarker.stop()
+            except Exception:
+                pass
         if self.client is None:
             return
         try:
@@ -229,7 +248,23 @@ class AirSimDroneRacingEnv(gym.Env):
             return
         self.client = airsim.MultirotorClient()
         self.client.confirmConnection()
-        self._resolve_drone_name()
+
+    def _init_image_benchmarker(self) -> None:
+        if not self.enable_image_benchmark:
+            return
+        if self.image_benchmarker is not None:
+            return
+
+        self.image_client = airsim.MultirotorClient()
+        self.image_client.confirmConnection()
+        module = importlib.import_module("adrl_agent.image_benchmarker")
+        build_fn = getattr(module, "build_image_benchmarker")
+        benchmark_config = dict(self.config.get("image_benchmark_config", {}))
+        benchmark_config.setdefault("vehicle_name", self.drone_name)
+        self.image_benchmarker = build_fn(
+            self.image_client,
+            benchmark_config,
+        )
 
     def _resolve_drone_name(self) -> None:
         if not self.drone_name:
@@ -239,10 +274,6 @@ class AirSimDroneRacingEnv(gym.Env):
         except Exception as exc:
             error_text = str(exc)
             if "Vehicle API for" in error_text and "is not available" in error_text:
-                print(
-                    f"Configured drone_name '{self.drone_name}' is unavailable. "
-                    "Falling back to default vehicle."
-                )
                 self.drone_name = ""
                 return
             raise
@@ -263,6 +294,8 @@ class AirSimDroneRacingEnv(gym.Env):
             time.sleep(float(self.config["level_load_sleep_sec"]))
             self._loaded_level_name = self.level_name
 
+        self._resolve_drone_name()
+        self._init_image_benchmarker()
         self.client.simResetRace()
         self.race_tier = self._start_race_with_fallback(self.race_tier)
         self._initialize_drone()
@@ -548,7 +581,7 @@ class AirSimDroneRacingEnv(gym.Env):
         return distance_to_current_gate <= self.gate_pass_threshold
 
     def _build_info(self, gate_passed: bool, terminated: bool, truncated: bool) -> dict[str, Any]:
-        return {
+        info = {
             "gate_index": self.current_gate_index,
             "num_gates": len(self.gate_positions),
             "gate_passed": gate_passed,
@@ -557,6 +590,11 @@ class AirSimDroneRacingEnv(gym.Env):
             "truncated": truncated,
             "rule_mixing_ratio": self.rule_mixing_ratio,
         }
+        if self.image_benchmarker is not None:
+            metrics = self.image_benchmarker.get_metrics()
+            info["image_benchmark_avg_fps"] = float(metrics.get("avg_fps", 0.0))
+            info["image_benchmark_num_images"] = float(metrics.get("num_images", 0.0))
+        return info
 
     def _load_rule_controller(self):
         controller_name = self.config.get("rule_based_controller")

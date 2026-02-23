@@ -1,0 +1,56 @@
+agent_mode: ppo
+
+runtime:
+  sim_launch_mode: gui
+  auto_launch_sim: false
+
+env:
+  drone_name: drone_1
+  level_name: Soccer_Field_Easy
+  race_tier: 1
+  episode_max_steps: 1000
+  time_step_sec: 0.1
+  gate_pass_threshold: 1.8
+  max_vel_xy: 8.0
+  max_vel_z: 4.0
+  max_yaw_rate_deg: 90.0
+  reward_progress_scale: 1.0
+  reward_time_penalty: -0.01
+  reward_gate_pass: 25.0
+  reward_collision: -120.0
+  reward_success: 200.0
+  disable_level_reload: false
+
+rule_assist:
+  rule_controller: gate_navigator
+  disable_rule_controller: false
+  rule_mix: 0.15
+  rule_velocity_gain: 0.45
+  rule_z_gain: 0.8
+  rule_yaw_gain: 2.0
+  rule_min_forward_speed: 1.0
+
+image_benchmark:
+  enable_image_benchmark: false
+  img_benchmark_type: simGetImages
+  img_benchmark_period_sec: 0.05
+  img_benchmark_camera_name: fpv_cam
+
+training:
+  framework: torch
+  iterations: 50
+  stop_reward: null
+  lr: 0.0003
+  gamma: 0.99
+  lambda_: 0.95
+  clip_param: 0.2
+  entropy_coeff: 0.0
+  train_batch_size: 2048
+  num_env_runners: 0
+  num_gpus: 0.0
+  seed: null
+  checkpoint_dir: null
+
+baseline:
+  baseline_vel_max: null
+  baseline_acc_max: null

@@ -7,114 +7,268 @@ import socket
 import subprocess
 import sys
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 PACKAGE_ROOT = PROJECT_ROOT / "rl-airsim"
 AIRSIM_RPC_PORT = 41451
+LEVEL_LOAD_SLEEP_SEC = 2.0
+RPC_WAIT_POLL_SEC = 2.0
+MAX_GATE_POSE_TRIALS = 10
+BASELINE_VIZ_TRAJ_COLOR_RGBA = [1.0, 0.0, 0.0, 1.0]
+BASELINE_TRAJECTORY_GAINS = {
+    "kp_cross_track": 5.0,
+    "kd_cross_track": 0.0,
+    "kp_vel_cross_track": 3.0,
+    "kd_vel_cross_track": 0.0,
+    "kp_along_track": 0.4,
+    "kd_along_track": 0.0,
+    "kp_vel_along_track": 0.04,
+    "kd_vel_along_track": 0.0,
+    "kp_z_track": 2.0,
+    "kd_z_track": 0.0,
+    "kp_vel_z": 0.4,
+    "kd_vel_z": 0.0,
+    "kp_yaw": 3.0,
+    "kd_yaw": 0.1,
+}
+BASELINE_LEVEL_MOTION_LIMITS = {
+    "Soccer_Field_Easy": (30.0, 15.0),
+    "Soccer_Field_Medium": (30.0, 15.0),
+    "ZhangJiaJie_Medium": (30.0, 15.0),
+    "Qualifier_Tier_1": (30.0, 15.0),
+    "Qualifier_Tier_2": (30.0, 15.0),
+    "Qualifier_Tier_3": (30.0, 15.0),
+    "Final_Tier_1": (30.0, 15.0),
+    "Final_Tier_2": (30.0, 15.0),
+    "Final_Tier_3": (30.0, 15.0),
+    "Building99_Hard": (4.0, 1.0),
+}
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 
+ALLOWED_AGENT_MODES = {"ppo", "baseline"}
+ALLOWED_SIM_LAUNCH_MODES = {"gui", "nodisplay"}
+ALLOWED_FRAMEWORKS = {"torch", "tf2"}
+ALLOWED_IMG_BENCHMARK_TYPES = {"simGetImage", "simGetImages"}
+
+DEFAULT_MAIN_CONFIG: dict[str, Any] = {
+    "agent_mode": "ppo",
+    "runtime": {
+        "sim_launch_mode": "gui",
+        "auto_launch_sim": False,
+    },
+    "env": {
+        "drone_name": "drone_1",
+        "level_name": "Soccer_Field_Easy",
+        "race_tier": 1,
+        "episode_max_steps": 1000,
+        "time_step_sec": 0.10,
+        "gate_pass_threshold": 1.8,
+        "max_vel_xy": 8.0,
+        "max_vel_z": 4.0,
+        "max_yaw_rate_deg": 90.0,
+        "reward_progress_scale": 1.0,
+        "reward_time_penalty": -0.01,
+        "reward_gate_pass": 25.0,
+        "reward_collision": -120.0,
+        "reward_success": 200.0,
+        "disable_level_reload": False,
+    },
+    "rule_assist": {
+        "rule_controller": "gate_navigator",
+        "disable_rule_controller": False,
+        "rule_mix": 0.15,
+        "rule_velocity_gain": 0.45,
+        "rule_z_gain": 0.8,
+        "rule_yaw_gain": 2.0,
+        "rule_min_forward_speed": 1.0,
+    },
+    "image_benchmark": {
+        "enable_image_benchmark": False,
+        "img_benchmark_type": "simGetImages",
+        "img_benchmark_period_sec": 0.05,
+        "img_benchmark_camera_name": "fpv_cam",
+    },
+    "training": {
+        "framework": "torch",
+        "iterations": 50,
+        "stop_reward": None,
+        "lr": 3e-4,
+        "gamma": 0.99,
+        "lambda_": 0.95,
+        "clip_param": 0.2,
+        "entropy_coeff": 0.0,
+        "train_batch_size": 2048,
+        "num_env_runners": 0,
+        "num_gpus": 0.0,
+        "seed": None,
+        "checkpoint_dir": None,
+    },
+    "baseline": {
+        "baseline_vel_max": None,
+        "baseline_acc_max": None,
+    },
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run PPO training or a baseline-inspired agent on AirSim Drone Racing Lab."
+        description="Run PPO training or baseline via YAML configuration."
     )
+    parser.add_argument(
+        "config",
+        type=Path,
+        help="Path to YAML config file (example: configs/main.sample.yaml).",
+    )
+    cli_args = parser.parse_args()
+    return _load_args_from_yaml(cli_args.config)
 
-    parser.add_argument(
-        "--agent-mode",
-        type=str,
-        choices=["ppo", "baseline"],
-        default="ppo",
-        help="Execution mode: PPO training or baseline-inspired spline agent.",
-    )
 
-    parser.add_argument("--drone-name", type=str, default="drone_1")
-    parser.add_argument("--level-name", type=str, default="Soccer_Field_Easy")
-    parser.add_argument("--race-tier", type=int, choices=[1, 2, 3], default=1)
-    parser.add_argument("--episode-max-steps", type=int, default=1000)
-    parser.add_argument("--time-step-sec", type=float, default=0.10)
-    parser.add_argument("--gate-pass-threshold", type=float, default=1.8)
-    parser.add_argument("--max-vel-xy", type=float, default=8.0)
-    parser.add_argument("--max-vel-z", type=float, default=4.0)
-    parser.add_argument("--max-yaw-rate-deg", type=float, default=90.0)
-    parser.add_argument("--reward-progress-scale", type=float, default=1.0)
-    parser.add_argument("--reward-time-penalty", type=float, default=-0.01)
-    parser.add_argument("--reward-gate-pass", type=float, default=25.0)
-    parser.add_argument("--reward-collision", type=float, default=-120.0)
-    parser.add_argument("--reward-success", type=float, default=200.0)
-    parser.add_argument(
-        "--disable-level-reload",
-        action="store_true",
-        help="If set, skip simLoadLevel on reset after first initialization.",
-    )
+def _load_args_from_yaml(config_path: Path) -> argparse.Namespace:
+    try:
+        import yaml
+    except Exception as exc:
+        raise RuntimeError(
+            "PyYAML is required. Install it with `pip install pyyaml`."
+        ) from exc
 
-    parser.add_argument(
-        "--rule-controller",
-        type=str,
-        default="gate_navigator",
-        help="Rule-based controller name or import path.",
-    )
-    parser.add_argument(
-        "--disable-rule-controller",
-        action="store_true",
-        help="Disable rule-based assist entirely.",
-    )
-    parser.add_argument(
-        "--rule-mix",
-        type=float,
-        default=0.15,
-        help="Blend ratio of rule-based action [0, 1].",
-    )
-    parser.add_argument("--rule-velocity-gain", type=float, default=0.45)
-    parser.add_argument("--rule-z-gain", type=float, default=0.8)
-    parser.add_argument("--rule-yaw-gain", type=float, default=2.0)
-    parser.add_argument("--rule-min-forward-speed", type=float, default=1.0)
+    resolved_path = config_path.expanduser()
+    if not resolved_path.is_absolute():
+        resolved_path = (Path.cwd() / resolved_path).resolve()
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"YAML config file not found: {resolved_path}")
 
-    parser.add_argument("--framework", type=str, choices=["torch", "tf2"], default="torch")
-    parser.add_argument("--iterations", type=int, default=50)
-    parser.add_argument("--stop-reward", type=float, default=None)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--lambda_", type=float, default=0.95)
-    parser.add_argument("--clip-param", type=float, default=0.2)
-    parser.add_argument("--entropy-coeff", type=float, default=0.0)
-    parser.add_argument("--train-batch-size", type=int, default=2048)
-    parser.add_argument("--num-env-runners", type=int, default=0)
-    parser.add_argument("--num-gpus", type=float, default=0.0)
-    parser.add_argument("--seed", type=int, default=None)
+    with resolved_path.open("r", encoding="utf-8") as f:
+        loaded = yaml.safe_load(f)
 
-    parser.add_argument(
-        "--baseline-vel-max",
-        type=float,
-        default=None,
-        help="Override baseline moveOnSpline maximum velocity.",
-    )
-    parser.add_argument(
-        "--baseline-acc-max",
-        type=float,
-        default=None,
-        help="Override baseline moveOnSpline maximum acceleration.",
-    )
+    if loaded is None:
+        loaded = {}
+    if not isinstance(loaded, dict):
+        raise ValueError(
+            f"Config root must be a mapping/object: {resolved_path}"
+        )
 
-    parser.add_argument("--checkpoint-dir", type=str, default=None)
-    parser.add_argument(
-        "--sim-launch-mode",
-        type=str,
-        choices=["gui", "nodisplay"],
-        default="gui",
-        help=(
-            "Simulator launch preset. "
-            "'nodisplay' applies ViewMode=NoDisplay and launches with -NoVSync -BENCHMARK."
+    merged = _deep_merge_config(DEFAULT_MAIN_CONFIG, loaded)
+    _validate_main_config(merged)
+    return _config_dict_to_namespace(merged)
+
+
+def _deep_merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(base)
+    for key, value in override.items():
+        if key not in merged:
+            raise KeyError(f"Unknown config key: {key}")
+        base_value = merged[key]
+        if isinstance(base_value, dict):
+            if not isinstance(value, dict):
+                raise TypeError(
+                    f"Config key '{key}' must be an object/mapping."
+                )
+            merged[key] = _deep_merge_config(base_value, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _validate_main_config(config: dict[str, Any]) -> None:
+    if config["agent_mode"] not in ALLOWED_AGENT_MODES:
+        raise ValueError(
+            f"agent_mode must be one of {sorted(ALLOWED_AGENT_MODES)}"
+        )
+    if config["runtime"]["sim_launch_mode"] not in ALLOWED_SIM_LAUNCH_MODES:
+        raise ValueError(
+            f"runtime.sim_launch_mode must be one of {sorted(ALLOWED_SIM_LAUNCH_MODES)}"
+        )
+    if int(config["env"]["race_tier"]) not in {1, 2, 3}:
+        raise ValueError("env.race_tier must be one of [1, 2, 3]")
+    if config["training"]["framework"] not in ALLOWED_FRAMEWORKS:
+        raise ValueError(
+            f"training.framework must be one of {sorted(ALLOWED_FRAMEWORKS)}"
+        )
+    if config["image_benchmark"]["img_benchmark_type"] not in ALLOWED_IMG_BENCHMARK_TYPES:
+        raise ValueError(
+            "image_benchmark.img_benchmark_type must be one of "
+            f"{sorted(ALLOWED_IMG_BENCHMARK_TYPES)}"
+        )
+
+
+def _config_dict_to_namespace(config: dict[str, Any]) -> argparse.Namespace:
+    runtime = config["runtime"]
+    env = config["env"]
+    rule = config["rule_assist"]
+    image = config["image_benchmark"]
+    training = config["training"]
+    baseline = config["baseline"]
+    return argparse.Namespace(
+        agent_mode=str(config["agent_mode"]),
+        sim_launch_mode=str(runtime["sim_launch_mode"]),
+        auto_launch_sim=bool(runtime["auto_launch_sim"]),
+        drone_name=str(env["drone_name"]),
+        level_name=str(env["level_name"]),
+        race_tier=int(env["race_tier"]),
+        episode_max_steps=int(env["episode_max_steps"]),
+        time_step_sec=float(env["time_step_sec"]),
+        gate_pass_threshold=float(env["gate_pass_threshold"]),
+        max_vel_xy=float(env["max_vel_xy"]),
+        max_vel_z=float(env["max_vel_z"]),
+        max_yaw_rate_deg=float(env["max_yaw_rate_deg"]),
+        reward_progress_scale=float(env["reward_progress_scale"]),
+        reward_time_penalty=float(env["reward_time_penalty"]),
+        reward_gate_pass=float(env["reward_gate_pass"]),
+        reward_collision=float(env["reward_collision"]),
+        reward_success=float(env["reward_success"]),
+        disable_level_reload=bool(env["disable_level_reload"]),
+        rule_controller=(
+            None
+            if rule["rule_controller"] is None
+            else str(rule["rule_controller"])
+        ),
+        disable_rule_controller=bool(rule["disable_rule_controller"]),
+        rule_mix=float(rule["rule_mix"]),
+        rule_velocity_gain=float(rule["rule_velocity_gain"]),
+        rule_z_gain=float(rule["rule_z_gain"]),
+        rule_yaw_gain=float(rule["rule_yaw_gain"]),
+        rule_min_forward_speed=float(rule["rule_min_forward_speed"]),
+        enable_image_benchmark=bool(image["enable_image_benchmark"]),
+        img_benchmark_type=str(image["img_benchmark_type"]),
+        img_benchmark_period_sec=float(image["img_benchmark_period_sec"]),
+        img_benchmark_camera_name=str(image["img_benchmark_camera_name"]),
+        framework=str(training["framework"]),
+        iterations=int(training["iterations"]),
+        stop_reward=(
+            None
+            if training["stop_reward"] is None
+            else float(training["stop_reward"])
+        ),
+        lr=float(training["lr"]),
+        gamma=float(training["gamma"]),
+        lambda_=float(training["lambda_"]),
+        clip_param=float(training["clip_param"]),
+        entropy_coeff=float(training["entropy_coeff"]),
+        train_batch_size=int(training["train_batch_size"]),
+        num_env_runners=int(training["num_env_runners"]),
+        num_gpus=float(training["num_gpus"]),
+        seed=(None if training["seed"] is None else int(training["seed"])),
+        checkpoint_dir=(
+            None
+            if training["checkpoint_dir"] in (None, "")
+            else str(training["checkpoint_dir"])
+        ),
+        baseline_vel_max=(
+            None
+            if baseline["baseline_vel_max"] is None
+            else float(baseline["baseline_vel_max"])
+        ),
+        baseline_acc_max=(
+            None
+            if baseline["baseline_acc_max"] is None
+            else float(baseline["baseline_acc_max"])
         ),
     )
-    parser.add_argument(
-        "--auto-launch-sim",
-        action="store_true",
-        help="Auto-launch simulator when RPC server is not reachable.",
-    )
-    return parser.parse_args()
 
 
 def build_env_config(args: argparse.Namespace) -> dict[str, Any]:
@@ -147,6 +301,12 @@ def build_env_config(args: argparse.Namespace) -> dict[str, Any]:
             "z_gain": args.rule_z_gain,
             "yaw_gain": args.rule_yaw_gain,
             "min_forward_speed": args.rule_min_forward_speed,
+        },
+        "enable_image_benchmark": bool(args.enable_image_benchmark),
+        "image_benchmark_config": {
+            "benchmark_type": args.img_benchmark_type,
+            "period_sec": args.img_benchmark_period_sec,
+            "camera_name": args.img_benchmark_camera_name,
         },
     }
 
@@ -224,46 +384,10 @@ def run_baseline_agent(args: argparse.Namespace) -> None:
     _patch_msgpackrpc_compatibility()
     import airsimdroneracinglab as airsim
 
-    client = _connect_baseline_client(
-        airsim_module=airsim,
-        sim_launch_mode=args.sim_launch_mode,
-    )
-
+    client = _connect_baseline_client(airsim_module=airsim, sim_launch_mode=args.sim_launch_mode)
+    effective_tier = _reset_world_and_start_race(client, args.level_name, args.race_tier)
     drone_name = _resolve_drone_name(client, args.drone_name)
-
-    client.simLoadLevel(args.level_name)
-    client.confirmConnection()
-    time.sleep(2.0)
-
-    client.simResetRace()
-    effective_tier = _start_race_with_fallback(client, args.race_tier)
-
-    _set_api_control(client, drone_name, True)
-    _set_armed(client, drone_name, True)
-
-    gains = airsim.TrajectoryTrackerGains(
-        kp_cross_track=5.0,
-        kd_cross_track=0.0,
-        kp_vel_cross_track=3.0,
-        kd_vel_cross_track=0.0,
-        kp_along_track=0.4,
-        kd_along_track=0.0,
-        kp_vel_along_track=0.04,
-        kd_vel_along_track=0.0,
-        kp_z_track=2.0,
-        kd_z_track=0.0,
-        kp_vel_z=0.4,
-        kd_vel_z=0.0,
-        kp_yaw=3.0,
-        kd_yaw=0.1,
-    )
-    client.setTrajectoryTrackerGains(gains, vehicle_name=drone_name)
-    time.sleep(0.2)
-
-    try:
-        client.takeoffAsync(vehicle_name=drone_name).join()
-    except TypeError:
-        client.takeoffAsync().join()
+    _initialize_baseline_drone(client, airsim, drone_name)
 
     gate_positions = _collect_sorted_gate_positions(client)
     if not gate_positions:
@@ -279,7 +403,48 @@ def run_baseline_agent(args: argparse.Namespace) -> None:
         f"gates={len(gate_positions)} vel_max={vel_max:.2f} acc_max={acc_max:.2f}"
     )
     print("[baseline] Following all gates with moveOnSplineAsync...")
+    _run_baseline_spline(
+        client=client,
+        drone_name=drone_name,
+        gate_positions=gate_positions,
+        vel_max=vel_max,
+        acc_max=acc_max,
+    )
+    print("[baseline] Finished.")
+    _shutdown_baseline_drone(client, drone_name)
 
+
+def _reset_world_and_start_race(client: Any, level_name: str, race_tier: int) -> int:
+    client.simLoadLevel(level_name)
+    client.confirmConnection()
+    time.sleep(LEVEL_LOAD_SLEEP_SEC)
+    client.simResetRace()
+    return _start_race_with_fallback(client, race_tier)
+
+
+def _initialize_baseline_drone(client: Any, airsim_module: Any, drone_name: str) -> None:
+    _set_api_control(client, drone_name, True)
+    _set_armed(client, drone_name, True)
+    gains = airsim_module.TrajectoryTrackerGains(**BASELINE_TRAJECTORY_GAINS)
+    client.setTrajectoryTrackerGains(gains, vehicle_name=drone_name)
+    time.sleep(0.2)
+    _takeoff(client, drone_name)
+
+
+def _takeoff(client: Any, drone_name: str) -> None:
+    try:
+        client.takeoffAsync(vehicle_name=drone_name).join()
+    except TypeError:
+        client.takeoffAsync().join()
+
+
+def _run_baseline_spline(
+    client: Any,
+    drone_name: str,
+    gate_positions: list[Any],
+    vel_max: float,
+    acc_max: float,
+) -> None:
     future = client.moveOnSplineAsync(
         gate_positions,
         vel_max=vel_max,
@@ -288,12 +453,13 @@ def run_baseline_agent(args: argparse.Namespace) -> None:
         add_velocity_constraint=False,
         add_acceleration_constraint=False,
         viz_traj=True,
-        viz_traj_color_rgba=[1.0, 0.0, 0.0, 1.0],
+        viz_traj_color_rgba=BASELINE_VIZ_TRAJ_COLOR_RGBA,
         vehicle_name=drone_name,
     )
     future.join()
-    print("[baseline] Finished.")
 
+
+def _shutdown_baseline_drone(client: Any, drone_name: str) -> None:
     try:
         _set_armed(client, drone_name, False)
         _set_api_control(client, drone_name, False)
@@ -329,7 +495,7 @@ def _ensure_airsim_server(sim_launch_mode: str, timeout_sec: float, log_prefix: 
     )
     print(f"[{log_prefix}] Waiting for RPC server (port {AIRSIM_RPC_PORT})...")
 
-    if not _wait_for_airsim_rpc(timeout_sec=timeout_sec, poll_sec=2.0):
+    if not _wait_for_airsim_rpc(timeout_sec=timeout_sec, poll_sec=RPC_WAIT_POLL_SEC):
         raise RuntimeError(
             f"AirSim server did not become available within {int(timeout_sec)} seconds "
             "after auto-launch."
@@ -433,61 +599,57 @@ def _resolve_drone_name(client: Any, configured_name: str) -> str:
     except Exception as exc:
         text = str(exc)
         if "Vehicle API for" in text and "is not available" in text:
-            print(
-                f"[baseline] Configured drone_name '{candidate}' is unavailable; "
-                "using default vehicle."
-            )
             return ""
         raise
 
 
 def _start_race_with_fallback(client: Any, requested_tier: int) -> int:
-    try:
-        client.simStartRace(requested_tier)
-        setattr(client, "race_tier", requested_tier)
+    mode, wrapper_error, raw_error = _attempt_start_race(client, requested_tier)
+    if mode is not None:
+        if mode == "raw":
+            print(
+                f"[baseline] simStartRace(tier={requested_tier}) wrapper failed; "
+                "started requested tier via raw RPC."
+            )
         return requested_tier
-    except Exception as exc:
-        wrapper_exc = exc
-
-    try:
-        # Bypass client-side competitor initialization (drone_2) and call server RPC directly.
-        client.client.call("simStartRace", requested_tier)
-        setattr(client, "race_tier", requested_tier)
-        print(
-            f"[baseline] simStartRace(tier={requested_tier}) wrapper failed; "
-            "started requested tier via raw RPC."
-        )
-        return requested_tier
-    except Exception as raw_exc:
-        raw_requested_exc = raw_exc
 
     if requested_tier != 2:
         print(
             f"[baseline] simStartRace(tier={requested_tier}) failed via wrapper/raw RPC; "
             "trying fallback tier=2."
         )
-        try:
-            client.simStartRace(2)
-            setattr(client, "race_tier", 2)
-            return 2
-        except Exception as fallback_wrapper_exc:
-            try:
-                client.client.call("simStartRace", 2)
-                setattr(client, "race_tier", 2)
+        fallback_mode, fallback_wrapper_error, fallback_raw_error = _attempt_start_race(client, 2)
+        if fallback_mode is not None:
+            if fallback_mode == "raw":
                 print("[baseline] simStartRace fallback succeeded via raw RPC (tier=2).")
-                return 2
-            except Exception as fallback_raw_exc:
-                raise RuntimeError(
-                    "Failed to start race. "
-                    f"requested_tier={requested_tier}, wrapper_error={wrapper_exc}, "
-                    f"raw_error={raw_requested_exc}, tier2_wrapper_error={fallback_wrapper_exc}, "
-                    f"tier2_raw_error={fallback_raw_exc}"
-                ) from fallback_raw_exc
+            return 2
+
+        raise RuntimeError(
+            "Failed to start race. "
+            f"requested_tier={requested_tier}, wrapper_error={wrapper_error}, "
+            f"raw_error={raw_error}, tier2_wrapper_error={fallback_wrapper_error}, "
+            f"tier2_raw_error={fallback_raw_error}"
+        ) from fallback_raw_error
 
     raise RuntimeError(
         "Failed to start race at tier=2 via both wrapper and raw RPC. "
-        f"wrapper_error={wrapper_exc}, raw_error={raw_requested_exc}"
-    ) from raw_requested_exc
+        f"wrapper_error={wrapper_error}, raw_error={raw_error}"
+    ) from raw_error
+
+
+def _attempt_start_race(client: Any, tier: int) -> tuple[str | None, Exception | None, Exception | None]:
+    try:
+        client.simStartRace(tier)
+        setattr(client, "race_tier", tier)
+        return "wrapper", None, None
+    except Exception as wrapper_error:
+        try:
+            # Bypass client-side competitor initialization (drone_2) and call server RPC directly.
+            client.client.call("simStartRace", tier)
+            setattr(client, "race_tier", tier)
+            return "raw", wrapper_error, None
+        except Exception as raw_error:
+            return None, wrapper_error, raw_error
 
 
 def _set_api_control(client: Any, vehicle_name: str, enabled: bool) -> None:
@@ -536,34 +698,36 @@ def _set_armed(client: Any, vehicle_name: str, armed: bool) -> None:
 
 def _collect_sorted_gate_positions(client: Any) -> list[Any]:
     gate_names_unsorted = client.simListSceneObjects("Gate.*")
-    gate_names_sorted_bad = sorted(gate_names_unsorted)
-    gate_indices_bad = [int(gate_name.split("_")[0][4:]) for gate_name in gate_names_sorted_bad]
-    gate_indices_correct = sorted(
-        range(len(gate_indices_bad)), key=lambda idx: gate_indices_bad[idx]
-    )
-    gate_names_sorted = [gate_names_sorted_bad[idx] for idx in gate_indices_correct]
+    gate_names_sorted = sorted(gate_names_unsorted, key=_gate_sort_key)
 
     positions: list[Any] = []
     for gate_name in gate_names_sorted:
         pose = client.simGetObjectPose(gate_name)
         retries = 0
-        while (
-            math.isnan(pose.position.x_val)
-            or math.isnan(pose.position.y_val)
-            or math.isnan(pose.position.z_val)
-        ) and retries < 10:
+        while not _is_valid_pose_position(pose) and retries < MAX_GATE_POSE_TRIALS:
             retries += 1
             pose = client.simGetObjectPose(gate_name)
-        if (
-            math.isnan(pose.position.x_val)
-            or math.isnan(pose.position.y_val)
-            or math.isnan(pose.position.z_val)
-        ):
+        if not _is_valid_pose_position(pose):
             raise RuntimeError(
                 f"Gate pose for {gate_name} is invalid after {retries} retries."
             )
         positions.append(pose.position)
     return positions
+
+
+def _gate_sort_key(gate_name: str) -> tuple[int, str]:
+    try:
+        return int(gate_name.split("_")[0][4:]), gate_name
+    except (IndexError, ValueError):
+        return 10**9, gate_name
+
+
+def _is_valid_pose_position(pose: Any) -> bool:
+    return not (
+        math.isnan(pose.position.x_val)
+        or math.isnan(pose.position.y_val)
+        or math.isnan(pose.position.z_val)
+    )
 
 
 def _baseline_motion_limits(
@@ -572,19 +736,7 @@ def _baseline_motion_limits(
     if vel_override is not None and acc_override is not None:
         return float(vel_override), float(acc_override)
 
-    defaults = {
-        "Soccer_Field_Easy": (30.0, 15.0),
-        "Soccer_Field_Medium": (30.0, 15.0),
-        "ZhangJiaJie_Medium": (30.0, 15.0),
-        "Qualifier_Tier_1": (30.0, 15.0),
-        "Qualifier_Tier_2": (30.0, 15.0),
-        "Qualifier_Tier_3": (30.0, 15.0),
-        "Final_Tier_1": (30.0, 15.0),
-        "Final_Tier_2": (30.0, 15.0),
-        "Final_Tier_3": (30.0, 15.0),
-        "Building99_Hard": (4.0, 1.0),
-    }
-    vel_default, acc_default = defaults.get(level_name, (20.0, 10.0))
+    vel_default, acc_default = BASELINE_LEVEL_MOTION_LIMITS.get(level_name, (20.0, 10.0))
     return (
         float(vel_override) if vel_override is not None else vel_default,
         float(acc_override) if acc_override is not None else acc_default,
