@@ -264,43 +264,60 @@ class AirSimDroneRacingEnv(gym.Env):
             self._loaded_level_name = self.level_name
 
         self.client.simResetRace()
-        self._start_race_with_fallback(self.race_tier)
+        self.race_tier = self._start_race_with_fallback(self.race_tier)
         self._initialize_drone()
         self._takeoff()
         self.gate_positions = self._get_ground_truth_gate_positions()
         self.current_gate_index = 0
 
-    def _start_race_with_fallback(self, requested_tier: int) -> None:
+    def _start_race_with_fallback(self, requested_tier: int) -> int:
         try:
             self.client.simStartRace(requested_tier)
             setattr(self.client, "race_tier", requested_tier)
-            return
+            return requested_tier
         except Exception as exc:
-            error_text = str(exc)
-            missing_competitor = (
-                "Vehicle API for 'drone_" in error_text and "is not available" in error_text
+            wrapper_exc = exc
+
+        try:
+            # Bypass client-side competitor initialization (drone_2) and call server RPC directly.
+            self.client.client.call("simStartRace", requested_tier)
+            setattr(self.client, "race_tier", requested_tier)
+            print(
+                f"simStartRace(tier={requested_tier}) wrapper failed. "
+                "Started requested tier via raw RPC."
             )
-            if missing_competitor:
+            return requested_tier
+        except Exception as raw_exc:
+            raw_requested_exc = raw_exc
+
+        if requested_tier != 2:
+            print(
+                f"simStartRace(tier={requested_tier}) failed via wrapper/raw RPC. "
+                "Trying fallback tier=2."
+            )
+
+            try:
+                self.client.simStartRace(2)
+                setattr(self.client, "race_tier", 2)
+                return 2
+            except Exception as fallback_wrapper_exc:
                 try:
-                    # Bypass client-side competitor initialization (drone_2) and call server RPC directly.
-                    self.client.client.call("simStartRace", requested_tier)
-                    setattr(self.client, "race_tier", requested_tier)
-                    print(
-                        f"simStartRace(tier={requested_tier}) wrapper failed due to missing "
-                        "competitor vehicle. Started requested tier via raw RPC."
-                    )
-                    return
-                except Exception as raw_exc:
-                    if requested_tier != 2:
-                        print(
-                            f"simStartRace(tier={requested_tier}) raw RPC failed. "
-                            "Falling back to tier=2."
-                        )
-                        self.client.simStartRace(2)
-                        setattr(self.client, "race_tier", 2)
-                        return
-                    raise raw_exc
-            raise
+                    self.client.client.call("simStartRace", 2)
+                    setattr(self.client, "race_tier", 2)
+                    print("simStartRace fallback succeeded via raw RPC (tier=2).")
+                    return 2
+                except Exception as fallback_raw_exc:
+                    raise RuntimeError(
+                        "Failed to start race. "
+                        f"requested_tier={requested_tier}, wrapper_error={wrapper_exc}, "
+                        f"raw_error={raw_requested_exc}, tier2_wrapper_error={fallback_wrapper_exc}, "
+                        f"tier2_raw_error={fallback_raw_exc}"
+                    ) from fallback_raw_exc
+
+        raise RuntimeError(
+            "Failed to start race at tier=2 via both wrapper and raw RPC. "
+            f"wrapper_error={wrapper_exc}, raw_error={raw_requested_exc}"
+        ) from raw_requested_exc
 
     def _initialize_drone(self):
         self._set_api_control(True)

@@ -447,29 +447,47 @@ def _start_race_with_fallback(client: Any, requested_tier: int) -> int:
         setattr(client, "race_tier", requested_tier)
         return requested_tier
     except Exception as exc:
-        text = str(exc)
-        missing_competitor = "Vehicle API for 'drone_" in text and "is not available" in text
-        if missing_competitor:
+        wrapper_exc = exc
+
+    try:
+        # Bypass client-side competitor initialization (drone_2) and call server RPC directly.
+        client.client.call("simStartRace", requested_tier)
+        setattr(client, "race_tier", requested_tier)
+        print(
+            f"[baseline] simStartRace(tier={requested_tier}) wrapper failed; "
+            "started requested tier via raw RPC."
+        )
+        return requested_tier
+    except Exception as raw_exc:
+        raw_requested_exc = raw_exc
+
+    if requested_tier != 2:
+        print(
+            f"[baseline] simStartRace(tier={requested_tier}) failed via wrapper/raw RPC; "
+            "trying fallback tier=2."
+        )
+        try:
+            client.simStartRace(2)
+            setattr(client, "race_tier", 2)
+            return 2
+        except Exception as fallback_wrapper_exc:
             try:
-                # Bypass client-side competitor initialization (drone_2) and call server RPC directly.
-                client.client.call("simStartRace", requested_tier)
-                setattr(client, "race_tier", requested_tier)
-                print(
-                    f"[baseline] simStartRace(tier={requested_tier}) wrapper failed due to missing "
-                    "competitor vehicle; started requested tier via raw RPC."
-                )
-                return requested_tier
-            except Exception as raw_exc:
-                if requested_tier != 2:
-                    print(
-                        f"[baseline] simStartRace(tier={requested_tier}) raw RPC failed; "
-                        "falling back to tier=2."
-                    )
-                    client.simStartRace(2)
-                    setattr(client, "race_tier", 2)
-                    return 2
-                raise raw_exc
-        raise
+                client.client.call("simStartRace", 2)
+                setattr(client, "race_tier", 2)
+                print("[baseline] simStartRace fallback succeeded via raw RPC (tier=2).")
+                return 2
+            except Exception as fallback_raw_exc:
+                raise RuntimeError(
+                    "Failed to start race. "
+                    f"requested_tier={requested_tier}, wrapper_error={wrapper_exc}, "
+                    f"raw_error={raw_requested_exc}, tier2_wrapper_error={fallback_wrapper_exc}, "
+                    f"tier2_raw_error={fallback_raw_exc}"
+                ) from fallback_raw_exc
+
+    raise RuntimeError(
+        "Failed to start race at tier=2 via both wrapper and raw RPC. "
+        f"wrapper_error={wrapper_exc}, raw_error={raw_requested_exc}"
+    ) from raw_requested_exc
 
 
 def _set_api_control(client: Any, vehicle_name: str, enabled: bool) -> None:
